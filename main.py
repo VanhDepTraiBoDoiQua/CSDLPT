@@ -1,16 +1,29 @@
-# This is a sample Python script.
+import psycopg2
 
-# Press Shift+F10 to execute it or replace it with your code.
-# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
+import config
+import myAssigment
 
-
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press Ctrl+F8 to toggle the breakpoint.
-
-
-# Press the green button in the gutter to run the script.
 if __name__ == '__main__':
-    print_hi('PyCharm')
+    try:
+        # Tạo db mới
+        myAssigment.create_db(config.DB_NAME)
 
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+        # Tạo kết nối đến db vừa tạo
+        conn = myAssigment.getopenconnection(config.USER, config.PASSWORD, config.DB_NAME)
+
+        # Thiết lập auto commit
+        conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+
+        # Reset db
+        myAssigment.deleteAllPublicTables(conn)
+
+        # Load ratings
+        myAssigment.loadratings("ratings", config.RATINGS_FILE_PATH, conn)
+
+        # TODO: Các hàm phân mảnh
+
+        # Ngắt kết nối
+        conn.close()
+
+    except Exception as err:
+        print(err)
