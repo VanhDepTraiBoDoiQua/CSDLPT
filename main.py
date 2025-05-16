@@ -1,5 +1,3 @@
-import psycopg2
-
 import config
 import myAssigment
 
@@ -9,10 +7,7 @@ if __name__ == '__main__':
         myAssigment.create_db(config.DB_NAME)
 
         # Tạo kết nối đến db vừa tạo
-        conn = myAssigment.getopenconnection(config.USER, config.PASSWORD, config.DB_NAME)
-
-        # Thiết lập auto commit
-        conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+        conn = myAssigment.getopenconnection(config.USER, config.PASSWORD, config.DB_NAME, config.HOST)
 
         # Reset db
         myAssigment.deleteAllPublicTables(conn)

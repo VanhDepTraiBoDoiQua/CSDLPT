@@ -1,10 +1,14 @@
 import psycopg2
-
+from psycopg2 import sql
 
 # Tạo kết nối đến db
-def getopenconnection(user='postgres', password='1234', dbname='postgres'):
-    query = f"dbname='{dbname}' user='{user}' host='localhost' password='{password}'"
-    conn = psycopg2.connect(query)
+def getopenconnection(user='postgres', password='1234', dbname='postgres', host='localhost'):
+    conn = psycopg2.connect(
+        dbname=dbname,
+        user=user,
+        password=password,
+        host=host
+    )
     print(f"Connected to {dbname}")
     return conn
 
@@ -21,13 +25,14 @@ def create_db(dbname):
     cur = conn.cursor()
 
     # Kiểm tra xem đã tồn tại db cần tạo hay chưa
-    countQuery = f"SELECT COUNT(*) FROM pg_catalog.pg_database WHERE datname='{dbname}'"
-    cur.execute(countQuery)
+    cur.execute("SELECT COUNT(*) FROM pg_catalog.pg_database WHERE datname = %s", (dbname,))
     count = cur.fetchone()[0]
 
     if count == 0:
         # Tạo db mới
-        createQuery = f"CREATE DATABASE {dbname}"
+        createQuery = sql.SQL("CREATE DATABASE {dbname}").format(
+            dbname=sql.Identifier(dbname)
+        )
         cur.execute(createQuery)
         print(f"Created database {dbname}")
 
@@ -51,38 +56,42 @@ def deleteAllPublicTables(openconnection):
         cur.execute("drop table if exists {0} CASCADE".format(tablename))
 
     cur.close()
+    openconnection.commit()
 
 
 def loadratings(ratingstablename, ratingsfilepath, openconnection):
     cur = openconnection.cursor()
 
     # Tạo bảng ratings
-    createQuery = f"""
-        CREATE TABLE IF NOT EXISTS {ratingstablename} (
-            UserId int,
-            extra1 char,
-            MovieId int,
-            extra2 char,
-            Rating float,
-            extra3 char,
-            timestamp bigint
+    # Sử dụng sql.Identifier để tránh tấn công SQL Injection
+    createQuery = sql.SQL("""
+        CREATE TABLE IF NOT EXISTS {table} (
+            UserId INT,
+            extra1 CHAR,
+            MovieId INT,
+            extra2 CHAR,
+            Rating FLOAT,
+            extra3 CHAR,
+            timestamp BIGINT
         );
-    """
+    """).format(table=sql.Identifier(ratingstablename))
     cur.execute(createQuery)
     print(f"Created table {ratingstablename}")
 
     # Đọc dữ liệu từ file và copy vào bảng
-    cur.copy_from(open(ratingsfilepath), ratingstablename, sep=':')
+    with open(ratingsfilepath, 'r') as f:
+        cur.copy_from(f, ratingstablename, sep=':')
 
     # Xoá các cột thừa
-    alterQuery = f"""
-        ALTER TABLE {ratingstablename}
+    alterQuery = sql.SQL("""
+        ALTER TABLE {table}
         DROP COLUMN extra1,
         DROP COLUMN extra2,
         DROP COLUMN extra3,
         DROP COLUMN timestamp;
-    """
+    """).format(table=sql.Identifier(ratingstablename))
     cur.execute(alterQuery)
     print(f"Data inserted into {ratingstablename} successfully")
 
     cur.close()
+    openconnection.commit()
