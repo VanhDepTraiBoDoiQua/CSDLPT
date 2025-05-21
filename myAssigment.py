@@ -95,3 +95,35 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
 
     cur.close()
     openconnection.commit()
+
+
+def rangePartition(ratingstablename, numberofpartitions, openconnection):
+    o = openconnection
+    cur = o.cursor()
+
+    # Tính phạm vi phân mảnh
+    partition_range = 5.0 / numberofpartitions
+
+    # Tạo các phân mảnh
+    for i in range(numberofpartitions):
+        min_rating = i * partition_range
+        max_rating = min_rating + partition_range
+        partition_table_name = "range_ratings_part" + str(i)
+
+        # Tạo bảng phân mảnh
+        cur.execute("CREATE TABLE " + partition_table_name + " (userid INTEGER, movieid INTEGER, rating FLOAT);")
+
+        # Chèn dữ liệu vào các bảng phân mảnh
+        if i == 0:
+            cur.execute(
+                "INSERT INTO " + partition_table_name + " (userid, movieid, rating) SELECT userid, movieid, rating FROM " + ratingstablename +
+                " WHERE rating >= " + str(min_rating) + " AND rating <= " + str(max_rating) + ";")
+        else:
+            cur.execute(
+                "INSERT INTO " + partition_table_name + " (userid, movieid, rating) SELECT userid, movieid, rating FROM " + ratingstablename +
+                " WHERE rating >" + str(min_rating) + " AND rating <= " + str(max_rating) + ";")
+
+    cur.close()
+    openconnection.commit()
+
+
