@@ -96,7 +96,18 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
     cur.close()
     openconnection.commit()
 
+# Đếm số lượng bảng có tên theo đúng quy tắc phân mảnh
+def get_partitions_count(prefix, openconnection):
+    o = openconnection
+    cur = o.cursor()
+    # Truy vấn số lượng bảng có tên bắt đầu bằng prefix
+    cur.execute("SELECT COUNT(table_name) FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE '{0}%';".format(prefix))
+    count = int(cur.fetchone()[0])  # Đếm số lượng bảng và lấy kết quả
+    cur.close()
+    openconnection.commit()
+    return count
 
+# Hàm Range_Partition()
 def rangePartition(ratingstablename, numberofpartitions, openconnection):
     o = openconnection
     cur = o.cursor()
@@ -126,4 +137,33 @@ def rangePartition(ratingstablename, numberofpartitions, openconnection):
     cur.close()
     openconnection.commit()
 
+# Hàm Range_Insert()
+def rangeInsert(ratingstablename, userid, itemid, rating, openconnection):
+    o = openconnection
+    cur = o.cursor()
+
+    # Lấy số lượng phân mảnh từ hàm get_partitions_count
+    no_of_partitions = get_partitions_count("range_ratings_part", openconnection)
+    partition_range = 5.0 / no_of_partitions
+
+    # Xác định phân mảnh và chèn dữ liệu vào đó
+    for i in range(no_of_partitions):
+        min_rating = i * partition_range
+        max_rating = min_rating + partition_range
+
+        if i == 0:
+            if rating >= min_rating and rating <= max_rating:
+                partition_table = "range_ratings_part" + str(i)
+                cur.execute("INSERT INTO " + ratingstablename + " (userid, movieid, rating) VALUES (%s, %s, %s)", (userid, itemid, rating))
+                cur.execute("INSERT INTO " + partition_table + " (userid, movieid, rating) VALUES (%s, %s, %s)", (userid, itemid, rating))
+                break
+        else:
+            if rating > min_rating and rating <= max_rating:
+                partition_table = "range_ratings_part" + str(i)
+                cur.execute("INSERT INTO " + ratingstablename + " (userid, movieid, rating) VALUES (%s, %s, %s)", (userid, itemid, rating))
+                cur.execute("INSERT INTO " + partition_table + " (userid, movieid, rating) VALUES (%s, %s, %s)", (userid, itemid, rating))
+                break
+
+    cur.close()
+    openconnection.commit()
 
