@@ -136,6 +136,85 @@ def rangePartition(ratingstablename, numberofpartitions, openconnection):
 
     cur.close()
     openconnection.commit()
+    
+    
+# --------------------- Round Robin Partitioning ---------------------
+def roundRobinPartition(ratingstablename, numberofpartitions, openconnection):
+    o = openconnection
+    cur = o.cursor()
+
+    # create metadata table to keep track of next partition index
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS roundrobin_metadata(next_partition INT);"
+    )
+    cur.execute("DELETE FROM roundrobin_metadata;")
+    cur.execute("INSERT INTO roundrobin_metadata VALUES (0);")
+
+    # create partition tables
+    for i in range(numberofpartitions):
+        table_name = "roundrobin_ratings_part" + str(i)
+        cur.execute(
+            "CREATE TABLE " + table_name + " (userid INTEGER, movieid INTEGER, rating FLOAT);"
+        )
+
+    # distribute existing rows in round robin fashion
+    for i in range(numberofpartitions):
+        insert_query = f"""
+            INSERT INTO roundrobin_ratings_part{i} (userid, movieid, rating)
+            SELECT userid, movieid, rating
+            FROM (
+                SELECT userid, movieid, rating,
+                       ROW_NUMBER() OVER () AS rn
+                FROM {ratingstablename}
+            ) AS tmp
+            WHERE (rn-1) % {numberofpartitions} = {i};
+        """
+        cur.execute(insert_query)
+
+    cur.close()
+    openconnection.commit()
+
+
+def roundRobinInsert(ratingstablename, userid, itemid, rating, openconnection):
+    o = openconnection
+    cur = o.cursor()
+
+    no_of_partitions = get_partitions_count("roundrobin_ratings_part", openconnection)
+    if no_of_partitions == 0:
+        # nothing to insert into
+        cur.close()
+        openconnection.commit()
+        return
+
+    # ensure metadata table exists
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS roundrobin_metadata(next_partition INT);"
+    )
+    cur.execute("SELECT next_partition FROM roundrobin_metadata LIMIT 1;")
+    row = cur.fetchone()
+    if row is None:
+        next_part = 0
+        cur.execute("INSERT INTO roundrobin_metadata VALUES (1);")
+    else:
+        next_part = row[0]
+        cur.execute(
+            "UPDATE roundrobin_metadata SET next_partition = %s;",
+            ((next_part + 1) % no_of_partitions,),
+        )
+
+    target_table = "roundrobin_ratings_part" + str(next_part)
+    cur.execute(
+        "INSERT INTO " + ratingstablename + " (userid, movieid, rating) VALUES (%s, %s, %s)",
+        (userid, itemid, rating),
+    )
+    cur.execute(
+        "INSERT INTO " + target_table + " (userid, movieid, rating) VALUES (%s, %s, %s)",
+        (userid, itemid, rating),
+    )
+
+    cur.close()
+    openconnection.commit()
+    
 
 # Hàm Range_Insert()
 def rangeInsert(ratingstablename, userid, itemid, rating, openconnection):
