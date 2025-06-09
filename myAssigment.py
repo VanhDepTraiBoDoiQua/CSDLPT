@@ -2,6 +2,8 @@ import psycopg2
 from psycopg2 import sql
 
 RROBIN_TABLE_PREFIX = 'rrobin_part'
+META_TABLE = 'roundrobin_metadata'
+SEQ_NAME = 'rr_seq' 
 
 # Open connection to the database
 def getopenconnection(user='postgres', password='12345678', dbname='postgres', host='localhost'):
@@ -71,8 +73,10 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
     cur.close()
     openconnection.commit()
 
-# Count existing round robin partitions
 def get_partitions_count(prefix, openconnection):
+    """
+    Đếm số bảng partition round robin đang tồn tại.
+    """
     cur = openconnection.cursor()
     cur.execute(
         "SELECT COUNT(table_name) FROM information_schema.tables "
@@ -81,72 +85,84 @@ def get_partitions_count(prefix, openconnection):
     )
     count = cur.fetchone()[0]
     cur.close()
-    openconnection.commit()
     return count
 
-# Round Robin Partitioning
 def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
-    cur = openconnection.cursor()
-    # Metadata table for next partition index
-    cur.execute("CREATE TABLE IF NOT EXISTS roundrobin_metadata(next_partition INT);")
-    cur.execute("DELETE FROM roundrobin_metadata;")
-    cur.execute("INSERT INTO roundrobin_metadata VALUES (0);")
-    # Create partition tables
-    for i in range(numberofpartitions):
-        table_name = RROBIN_TABLE_PREFIX + str(i)
-        cur.execute(
-            f"CREATE TABLE IF NOT EXISTS {table_name} (userid INTEGER, movieid INTEGER, rating FLOAT);"
-        )
-    # Distribute existing rows
-    for i in range(numberofpartitions):
-        part_name = f"{RROBIN_TABLE_PREFIX}{i}"
-        insert_query = sql.SQL(
-            "INSERT INTO {part} (userid, movieid, rating) "
-            "SELECT userid, movieid, rating FROM ("
-            "  SELECT userid, movieid, rating, ROW_NUMBER() OVER () AS rn "
-            "  FROM {main}"
-            ") AS tmp "
-            "WHERE (rn - 1) %% %s = %s;"
-        ).format(
-            part=sql.Identifier(part_name),
-            main=sql.Identifier(ratingstablename)
-        )
-        cur.execute(insert_query, (numberofpartitions, i))
-    cur.close()
-    openconnection.commit()
-
-# Insert a single row in round robin fashion
-def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
-    cur = openconnection.cursor()
-    no_of_partitions = get_partitions_count(RROBIN_TABLE_PREFIX, openconnection)
-    if no_of_partitions == 0:
-        cur.close()
+    """
+    Chia dữ liệu bảng rating thành nhiều partition theo round robin.
+    """
+    with openconnection.cursor() as cur:
+        # Xóa các bảng partition cũ (nếu có)
+        cur.execute(sql.SQL("""
+            SELECT tablename
+            FROM   pg_tables
+            WHERE  schemaname = 'public'
+            AND tablename LIKE %s
+        """), (RROBIN_TABLE_PREFIX + '%',))
+        old_parts = [t[0] for t in cur.fetchall()]
+        for t in old_parts:
+            cur.execute(sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(sql.Identifier(t)))
+        # Tạo các bảng partition mới
+        for i in range(numberofpartitions):
+            cur.execute(sql.SQL("""
+                CREATE UNLOGGED TABLE {part} (
+                    userid  INTEGER,
+                    movieid INTEGER,
+                    rating  FLOAT
+                );
+            """).format(part=sql.Identifier(f"{RROBIN_TABLE_PREFIX}{i}")))
+        # Đánh số dòng và insert vào từng partition
+        base_query = sql.SQL("""
+            WITH numbered AS (
+                SELECT userid, movieid, rating,
+                       ROW_NUMBER() OVER () - 1 AS rn   -- bắt đầu từ 0
+                FROM   {ratings}
+            )
+        """).format(ratings=sql.Identifier(ratingstablename))
+        for i in range(numberofpartitions):
+            cur.execute(base_query + sql.SQL("""
+                INSERT INTO {part} (userid, movieid, rating)
+                SELECT userid, movieid, rating
+                FROM   numbered
+                WHERE  rn % {n} = {i};
+            """).format(
+                part = sql.Identifier(f"{RROBIN_TABLE_PREFIX}{i}"),
+                n    = sql.Literal(numberofpartitions),
+                i    = sql.Literal(i)
+            ))
+        # Reset lại sequence và metadata
+        cur.execute("""
+            DROP SEQUENCE IF EXISTS rr_seq CASCADE;
+            CREATE SEQUENCE rr_seq;
+        """)
+        cur.execute("""
+            DROP TABLE IF EXISTS roundrobin_metadata;
+            CREATE TABLE roundrobin_metadata (
+                num_partitions  INTEGER NOT NULL,
+                CONSTRAINT rr_meta_pk CHECK (num_partitions > 0)
+            );
+        """)
+        cur.execute("INSERT INTO roundrobin_metadata VALUES (%s);", (numberofpartitions,))
         openconnection.commit()
-        return
-    # Ensure metadata exists
-    cur.execute("CREATE TABLE IF NOT EXISTS roundrobin_metadata(next_partition INT);")
-    cur.execute("SELECT next_partition FROM roundrobin_metadata LIMIT 1;")
-    row = cur.fetchone()
-    if row is None:
-        next_part = 0
-        cur.execute("INSERT INTO roundrobin_metadata VALUES (1);")
-    else:
-        next_part = row[0]
-        cur.execute(
-            "UPDATE roundrobin_metadata SET next_partition = %s;",
-            ((next_part + 1) % no_of_partitions,)
-        )
-    # Insert into main and partition table
-    target_table = RROBIN_TABLE_PREFIX + str(next_part)
-    cur.execute(
-        sql.SQL("INSERT INTO {main_table} (userid, movieid, rating) VALUES (%s, %s, %s)")
-        .format(main_table=sql.Identifier(ratingstablename)),
-        (userid, itemid, rating)
-    )
-    cur.execute(
-        sql.SQL("INSERT INTO {part_table} (userid, movieid, rating) VALUES (%s, %s, %s)")
-        .format(part_table=sql.Identifier(target_table)),
-        (userid, itemid, rating)
-    )
-    cur.close()
-    openconnection.commit()
+
+def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
+    """
+    Thêm 1 dòng vào bảng rating và partition tương ứng theo round robin.
+    """
+    with openconnection.cursor() as cur:
+        # Lấy số lượng partition
+        cur.execute(sql.SQL("SELECT num_partitions FROM {m};").format(m=sql.Identifier(META_TABLE)))
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Thiếu thông tin metadata round robin")
+        n_partitions = row[0]
+        # Lấy slot tiếp theo (atomic)
+        cur.execute(sql.SQL("SELECT nextval({seq});").format(seq=sql.Literal(SEQ_NAME)))
+        slot = cur.fetchone()[0]
+        target_index = (slot - 1) % n_partitions
+        target_table = f"{RROBIN_TABLE_PREFIX}{target_index}"
+        # Insert vào bảng chính và bảng partition
+        insert_sql = sql.SQL("INSERT INTO {tbl} (userid, movieid, rating) VALUES (%s, %s, %s)")
+        for tbl in (ratingstablename, target_table):
+            cur.execute(insert_sql.format(tbl=sql.Identifier(tbl)), (userid, itemid, rating))
+        openconnection.commit()
