@@ -1,7 +1,9 @@
 import psycopg2
 from psycopg2 import sql
 
-# Tạo kết nối đến db
+RROBIN_TABLE_PREFIX = 'rrobin_part'
+
+# Open connection to the database
 def getopenconnection(user='postgres', password='12345678', dbname='postgres', host='localhost'):
     conn = psycopg2.connect(
         dbname=dbname,
@@ -12,59 +14,34 @@ def getopenconnection(user='postgres', password='12345678', dbname='postgres', h
     print(f"Connected to {dbname}")
     return conn
 
-
-# Tạo db mới
+# Create a new database if it doesn't exist
 def create_db(dbname):
-    # Tạo kết nối đến db mặc định
     conn = getopenconnection()
-
-    # Thiết lập auto commit
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
-
-    # Tạo một con trỏ để thực hiện truy vấn
     cur = conn.cursor()
-
-    # Kiểm tra xem đã tồn tại db cần tạo hay chưa
     cur.execute("SELECT COUNT(*) FROM pg_catalog.pg_database WHERE datname = %s", (dbname,))
-    count = cur.fetchone()[0]
-
-    if count == 0:
-        # Tạo db mới
-        createQuery = sql.SQL("CREATE DATABASE {dbname}").format(
-            dbname=sql.Identifier(dbname)
-        )
-        cur.execute(createQuery)
+    if cur.fetchone()[0] == 0:
+        cur.execute(sql.SQL("CREATE DATABASE {dbname}").format(dbname=sql.Identifier(dbname)))
         print(f"Created database {dbname}")
-
     else:
         print(f"Database {dbname} already exists")
-
-    # Đóng kết nối
     cur.close()
     conn.close()
 
-
-# Xoá tất cả bảng public của db
+# Drop all tables in the public schema
 def deleteAllPublicTables(openconnection):
     cur = openconnection.cursor()
-
     cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
-    l = []
-    for row in cur:
-        l.append(row[0])
-    for tablename in l:
-        cur.execute("drop table if exists {0} CASCADE".format(tablename))
-
+    for (tablename,) in cur:
+        cur.execute(f"DROP TABLE IF EXISTS {tablename} CASCADE")
     cur.close()
     openconnection.commit()
 
-
+# Load ratings data into a table
 def loadratings(ratingstablename, ratingsfilepath, openconnection):
     cur = openconnection.cursor()
-
-    # Tạo bảng ratings
-    # Sử dụng sql.Identifier để tránh tấn công SQL Injection
-    createQuery = sql.SQL("""
+    createQuery = sql.SQL(
+        """
         CREATE TABLE IF NOT EXISTS {table} (
             UserId INT,
             extra1 CHAR,
@@ -74,122 +51,80 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
             extra3 CHAR,
             timestamp BIGINT
         );
-    """).format(table=sql.Identifier(ratingstablename))
+        """
+    ).format(table=sql.Identifier(ratingstablename))
     cur.execute(createQuery)
     print(f"Created table {ratingstablename}")
-
-    # Đọc dữ liệu từ file và copy vào bảng
     with open(ratingsfilepath, 'r') as f:
         cur.copy_from(f, ratingstablename, sep=':')
-
-    # Xoá các cột thừa
-    alterQuery = sql.SQL("""
+    alterQuery = sql.SQL(
+        """
         ALTER TABLE {table}
         DROP COLUMN extra1,
         DROP COLUMN extra2,
         DROP COLUMN extra3,
         DROP COLUMN timestamp;
-    """).format(table=sql.Identifier(ratingstablename))
+        """
+    ).format(table=sql.Identifier(ratingstablename))
     cur.execute(alterQuery)
     print(f"Data inserted into {ratingstablename} successfully")
-
     cur.close()
     openconnection.commit()
 
-# Đếm số lượng bảng có tên theo đúng quy tắc phân mảnh
+# Count existing round robin partitions
 def get_partitions_count(prefix, openconnection):
-    o = openconnection
-    cur = o.cursor()
-    # Truy vấn số lượng bảng có tên bắt đầu bằng prefix
-    cur.execute("SELECT COUNT(table_name) FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE '{0}%';".format(prefix))
-    count = int(cur.fetchone()[0])  # Đếm số lượng bảng và lấy kết quả
+    cur = openconnection.cursor()
+    cur.execute(
+        "SELECT COUNT(table_name) FROM information_schema.tables "
+        "WHERE table_schema = 'public' AND table_name LIKE %s;",
+        (prefix + '%',)
+    )
+    count = cur.fetchone()[0]
     cur.close()
     openconnection.commit()
     return count
 
-# Hàm Range_Partition()
-def rangepartition(ratingstablename, numberofpartitions, openconnection):
-    o = openconnection
-    cur = o.cursor()
-
-    # Tính phạm vi phân mảnh
-    partition_range = 5.0 / numberofpartitions
-
-    # Tạo các phân mảnh
-    for i in range(numberofpartitions):
-        min_rating = i * partition_range
-        max_rating = min_rating + partition_range
-        partition_table_name = "range_ratings_part" + str(i)
-
-        # Tạo bảng phân mảnh
-        cur.execute("CREATE TABLE " + partition_table_name + " (userid INTEGER, movieid INTEGER, rating FLOAT);")
-
-        # Chèn dữ liệu vào các bảng phân mảnh
-        if i == 0:
-            cur.execute(
-                "INSERT INTO " + partition_table_name + " (userid, movieid, rating) SELECT userid, movieid, rating FROM " + ratingstablename +
-                " WHERE rating >= " + str(min_rating) + " AND rating <= " + str(max_rating) + ";")
-        else:
-            cur.execute(
-                "INSERT INTO " + partition_table_name + " (userid, movieid, rating) SELECT userid, movieid, rating FROM " + ratingstablename +
-                " WHERE rating >" + str(min_rating) + " AND rating <= " + str(max_rating) + ";")
-
-    cur.close()
-    openconnection.commit()
-    
-    
-# --------------------- Round Robin Partitioning ---------------------
-def roundRobinPartition(ratingstablename, numberofpartitions, openconnection):
-    o = openconnection
-    cur = o.cursor()
-
-    # create metadata table to keep track of next partition index
-    cur.execute(
-        "CREATE TABLE IF NOT EXISTS roundrobin_metadata(next_partition INT);"
-    )
+# Round Robin Partitioning
+def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
+    cur = openconnection.cursor()
+    # Metadata table for next partition index
+    cur.execute("CREATE TABLE IF NOT EXISTS roundrobin_metadata(next_partition INT);")
     cur.execute("DELETE FROM roundrobin_metadata;")
     cur.execute("INSERT INTO roundrobin_metadata VALUES (0);")
-
-    # create partition tables
+    # Create partition tables
     for i in range(numberofpartitions):
-        table_name = "roundrobin_ratings_part" + str(i)
+        table_name = RROBIN_TABLE_PREFIX + str(i)
         cur.execute(
-            "CREATE TABLE " + table_name + " (userid INTEGER, movieid INTEGER, rating FLOAT);"
+            f"CREATE TABLE IF NOT EXISTS {table_name} (userid INTEGER, movieid INTEGER, rating FLOAT);"
         )
-
-    # distribute existing rows in round robin fashion
+    # Distribute existing rows
     for i in range(numberofpartitions):
-        insert_query = f"""
-            INSERT INTO roundrobin_ratings_part{i} (userid, movieid, rating)
-            SELECT userid, movieid, rating
-            FROM (
-                SELECT userid, movieid, rating,
-                       ROW_NUMBER() OVER () AS rn
-                FROM {ratingstablename}
-            ) AS tmp
-            WHERE (rn-1) % {numberofpartitions} = {i};
-        """
-        cur.execute(insert_query)
-
+        part_name = f"{RROBIN_TABLE_PREFIX}{i}"
+        insert_query = sql.SQL(
+            "INSERT INTO {part} (userid, movieid, rating) "
+            "SELECT userid, movieid, rating FROM ("
+            "  SELECT userid, movieid, rating, ROW_NUMBER() OVER () AS rn "
+            "  FROM {main}"
+            ") AS tmp "
+            "WHERE (rn - 1) %% %s = %s;"
+        ).format(
+            part=sql.Identifier(part_name),
+            main=sql.Identifier(ratingstablename)
+        )
+        cur.execute(insert_query, (numberofpartitions, i))
     cur.close()
     openconnection.commit()
 
-
+# Insert a single row in round robin fashion
 def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
-    o = openconnection
-    cur = o.cursor()
-
-    no_of_partitions = get_partitions_count("roundrobin_ratings_part", openconnection)
+    cur = openconnection.cursor()
+    no_of_partitions = get_partitions_count(RROBIN_TABLE_PREFIX, openconnection)
     if no_of_partitions == 0:
-        # nothing to insert into
         cur.close()
         openconnection.commit()
         return
-
-    # ensure metadata table exists
-    cur.execute(
-        "CREATE TABLE IF NOT EXISTS roundrobin_metadata(next_partition INT);"
-    )
+    # Ensure metadata exists
+    cur.execute("CREATE TABLE IF NOT EXISTS roundrobin_metadata(next_partition INT);")
     cur.execute("SELECT next_partition FROM roundrobin_metadata LIMIT 1;")
     row = cur.fetchone()
     if row is None:
@@ -199,50 +134,19 @@ def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
         next_part = row[0]
         cur.execute(
             "UPDATE roundrobin_metadata SET next_partition = %s;",
-            ((next_part + 1) % no_of_partitions,),
+            ((next_part + 1) % no_of_partitions,)
         )
-
-    target_table = "roundrobin_ratings_part" + str(next_part)
+    # Insert into main and partition table
+    target_table = RROBIN_TABLE_PREFIX + str(next_part)
     cur.execute(
-        "INSERT INTO " + ratingstablename + " (userid, movieid, rating) VALUES (%s, %s, %s)",
-        (userid, itemid, rating),
+        sql.SQL("INSERT INTO {main_table} (userid, movieid, rating) VALUES (%s, %s, %s)")
+        .format(main_table=sql.Identifier(ratingstablename)),
+        (userid, itemid, rating)
     )
     cur.execute(
-        "INSERT INTO " + target_table + " (userid, movieid, rating) VALUES (%s, %s, %s)",
-        (userid, itemid, rating),
+        sql.SQL("INSERT INTO {part_table} (userid, movieid, rating) VALUES (%s, %s, %s)")
+        .format(part_table=sql.Identifier(target_table)),
+        (userid, itemid, rating)
     )
-
     cur.close()
     openconnection.commit()
-    
-
-# Hàm Range_Insert()
-def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
-    o = openconnection
-    cur = o.cursor()
-
-    # Lấy số lượng phân mảnh từ hàm get_partitions_count
-    no_of_partitions = get_partitions_count("range_ratings_part", openconnection)
-    partition_range = 5.0 / no_of_partitions
-
-    # Xác định phân mảnh và chèn dữ liệu vào đó
-    for i in range(no_of_partitions):
-        min_rating = i * partition_range
-        max_rating = min_rating + partition_range
-
-        if i == 0:
-            if rating >= min_rating and rating <= max_rating:
-                partition_table = "range_ratings_part" + str(i)
-                cur.execute("INSERT INTO " + ratingstablename + " (userid, movieid, rating) VALUES (%s, %s, %s)", (userid, itemid, rating))
-                cur.execute("INSERT INTO " + partition_table + " (userid, movieid, rating) VALUES (%s, %s, %s)", (userid, itemid, rating))
-                break
-        else:
-            if rating > min_rating and rating <= max_rating:
-                partition_table = "range_ratings_part" + str(i)
-                cur.execute("INSERT INTO " + ratingstablename + " (userid, movieid, rating) VALUES (%s, %s, %s)", (userid, itemid, rating))
-                cur.execute("INSERT INTO " + partition_table + " (userid, movieid, rating) VALUES (%s, %s, %s)", (userid, itemid, rating))
-                break
-
-    cur.close()
-    openconnection.commit()
-
