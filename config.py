@@ -1,5 +1,5 @@
 USER = 'postgres'
 DB_NAME = 'movies'
-PASSWORD = '1234'
+PASSWORD = '123456'
 HOST = 'localhost'
 RATINGS_FILE_PATH = 'ratings.dat'
