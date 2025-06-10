@@ -15,7 +15,17 @@ if __name__ == '__main__':
         # Load ratings
         Interface.loadratings("ratings", config.RATINGS_FILE_PATH, conn)
 
-        # TODO: Các hàm phân mảnh
+        # Phân mảnh theo khoảng
+        Interface.rangepartition("ratings", 5, conn)
+
+        # Chèn dữ liệu theo khoảng
+        # Interface.rangeinsert("ratings", 100, 2, 3, conn)
+
+        # Phân mảnh vòng tròn
+        Interface.roundrobinpartition("ratings", 5, conn)
+
+        # Chèn dữ liệu vòng tròn
+        # Interface.roundrobininsert("ratings", 100, 2, 3, conn)
 
         # Ngắt kết nối
         conn.close()
